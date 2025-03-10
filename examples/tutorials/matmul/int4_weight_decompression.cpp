@@ -71,195 +71,181 @@ void init_vector(std::vector<float> &v) {
     for (auto &e : v)
         e = u(gen);
 }
-// Comparing two vectors by calculating their L2 norms and the L2 norm of their
-// difference Checking if the difference is within a calculated threshold The
-// function returns 0 if the vectors are considered similar, otherwise it
-// returns 1.
-int compare_vectors(const std::vector<float> &v1, const std::vector<float> &v2,
-        int64_t K, const char *message) {
-    double v1_l2 = 0, diff_l2 = 0;
-    for (size_t n = 0; n < v1.size(); ++n) {
-        float diff = v1[n] - v2[n];
-        v1_l2 += v1[n] * v1[n];
-        diff_l2 += diff * diff;
-    }
 
-    v1_l2 = std::sqrt(v1_l2);
-    diff_l2 = std::sqrt(diff_l2);
-
-    // Finding the reasonable (tight and accurate) threshold is quite difficult
-    // problem.
-    // The implementation testing might also use special data filling to
-    // alleviate issues related to the finite precision arithmetic.
-    // However, in simple cases the machine epsilon multiplied by log(K) should
-    // work reasonably well.
-    const double threshold = std::numeric_limits<float>::epsilon()
-            * std::log(std::max(2., (double)K));
-    bool ok = diff_l2 <= threshold * v1_l2;
-
-    printf("%s\n\tL2 Norms"
-           "\n\t\tReference matrix:%g\n\t\tError:%g\n\t\tRelative_error:%g\n"
-           "\tAccuracy check: %s\n",
-            message, v1_l2, diff_l2, diff_l2 / v1_l2, ok ? "OK" : "FAILED");
-
-    return ok ? 0 : 1;
+void init_vector(std::vector<int32_t> &v) {
+    std::mt19937 gen;
+    std::uniform_int_distribution<int32_t> u(0, 511);
+    for (auto &e : v)
+        e = u(gen);
 }
 
-} // namespace
+// Transpose the INT4 data for the src vector which packs 8 INT4 values as INT32,
+// for example, the data babababa is transposed to abababab.
+void transpose_s4(const std::vector<int32_t> &src, std::vector<int32_t> &dst, int32_t K, int32_t N) {
+    // Ensure dst is the correct size
+    dst.resize(src.size());
 
-// Floating point MatMul
-// Inputs:
-// - Shape: M, N, K
-// - Matrices A and B
-// Outputs:
-// - Matrix C
-void ref_compute_matmul_f32(int64_t M, int64_t N, int64_t K, int64_t G,
-        std::vector<float> &A_f32, std::vector<float> &B_f32,
-        std::vector<float> &zp_B_f32, std::vector<float> &sc_B,
-        std::vector<float> &C_f32) {
-    // Perform the GEMM operation
-    for (int m = 0; m < M; ++m) {
-        for (int n = 0; n < N; ++n) {
-            for (int k = 0; k < K; ++k) {
-                // Decompress the weight
-                int64_t idx1 = k * N + n;
-                int64_t idx2 = (k / G) * N + n;
-                float decompressed_B
-                        = (B_f32[idx1] - zp_B_f32[idx1]) * sc_B[idx2];
-                // Perform the multiplication and accumulation
-                C_f32[m * N + n] += A_f32[m * K + k] * decompressed_B;
+    // Iterate over the src vector to transpose the INT4 data
+    for (int32_t k = 0; k < K; ++k) {
+        for (int32_t n = 0; n < N; ++n) {
+            // Extract INT4 values from src
+            int32_t src_byte = src[k * N + n];
+            for (int32_t i = 0; i < 8; ++i) {
+                int8_t src_int4 = (src_byte >> (i * 4)) & 0x0F;
+
+                // Calculate destination indices
+                int32_t dst_index = (n * K + k) / 8;
+                int32_t dst_offset = (n * K + k) % 8;
+
+                // Pack INT4 values into dst
+                dst[dst_index] &= ~(0x0F << (dst_offset * 4)); // Clear the destination INT4
+                dst[dst_index] |= (src_int4 << (dst_offset * 4)); // Set the destination INT4
             }
         }
     }
 }
 
-// Create a MatMul primitive descriptor for the following op:
-// C_f32 = A_f32 * (B_s4 - zp_B) * sc_B[:]
-matmul::primitive_desc matmul_pd_create(
-        int64_t M, int64_t N, int64_t K, int64_t G, const engine &eng) {
+} // namespace
 
-    memory::desc a_md({M, K}, memory::data_type::f32, {K, 1}); // M x K layout
-    memory::desc b_md({K, N}, memory::data_type::s4,
-            memory::format_tag::any); // K x N layout
-    memory::desc c_md({M, N}, memory::data_type::f32, {N, 1}); // M x N layout
+int32_t number_of_runs = 1;
+
+// Create a MatMul primitive descriptor for the following op:
+// C_f16 = A_f16 * (B_s4 - zp_B) * sc_B[:]
+//
+// Here:
+// - Matrices A and C are of f16 data type.
+// - The B matrix is stored as s4 with format tag ab, its zero point is zp_B, 
+//   and all its dimensions are known. This matrix can be a matrix of compressed
+//   weights in an MLP topology.
+// - The weights scaling and zero point values are not known at the primitive creation time.
+matmul::primitive_desc matmul_pd_create(
+        int64_t M, int64_t N, int64_t K, int64_t G_SC, int64_t G_ZP, const engine &eng) {
+
+    memory::desc a_md({M, K}, memory::data_type::f16, memory::format_tag::ab); // M x K layout
+    // oneDNN doesn't have a notion of format for zero-points and it's always considered as tag::ab
+    // In this example, we align the weights format to match the format tag::ab of the zero-points
+    memory::desc b_s4_md({K, N}, memory::data_type::s4, memory::format_tag::ab); // N x K layout
+    memory::desc c_md({M, N}, memory::data_type::f16, memory::format_tag::ab); // M x N layout
 
     // Create attributes and indicate that the alpha and zero points are
     // runtime parameters
     primitive_attr attr;
-    // Set scales with multiple scales along K and N dimensions and with groups
-    // along K.
+    // Set scales with multiple scales along K and N dimensions and with groups along K.
     attr.set_scales(DNNL_ARG_WEIGHTS,
-            /* mask */ (1 << 0) + (1 << 1), {G, 1}, memory::data_type::f32);
+            /* mask */ (1 << 0) + (1 << 1), {G_SC, 1}, memory::data_type::f16);
 
-    // Set zero points with s4 data type.
-    // The mask determines which dimensions the zero points are applied to.
-    // Current mask value (1 << 0) + (1 << 1) means zero points are applied
-    // both along K and N dimensions.
-    // Changing the mask value would alter the dimensions along which the zero
-    // points are applied. For example:
-    // - mask = (1 << 0) would apply zero points only along the K dimension.
-    // - mask = (1 << 1) would apply zero points only along the N dimension.
-    int mask = (1 << 0) + (1 << 1); // zero points both along K and N dimensions
-    memory::dims groups = {};
-    attr.set_zero_points(DNNL_ARG_WEIGHTS, mask, groups, memory::data_type::s4);
+    // Set zero points with s4 data type both along K and N dimensions and with groups along K.
+    // oneDNN APIs consider zero-points as INT4 elements which are NOT packed into INT32 value
+    attr.set_zero_points(
+            DNNL_ARG_WEIGHTS, (1 << 0) + (1 << 1), {G_ZP, 1}, memory::data_type::s4);
 
     // Set fpmath mode with `apply_to_int=true` to apply fpmath mode behavior to
     // integral primitives (in this example, matmul).
     attr.set_fpmath_mode(fpmath_mode::f16, true);
 
     // Create a MatMul primitive descriptor
-    return matmul::primitive_desc(eng, a_md, b_md, c_md, attr);
+    return matmul::primitive_desc(eng, a_md, b_s4_md, c_md, attr);
 }
 
-// Function to perform matrix multiplication with int4 weights decompression
-// using oneDNN
-void weights_decompression_matmul(int64_t M, int64_t N, int64_t K, int64_t G,
-        std::vector<float> &A_f32, std::vector<float> &B_f32,
-        std::vector<float> &zp_B_f32, std::vector<float> &sc_B,
-        std::vector<float> &C_f32, const engine &eng) {
-    auto matmul_pd = matmul_pd_create(M, N, K, G, eng);
-    stream s(eng);
+void prepare_input(memory &A_f16_mem, memory &sc_B_mem, memory &zp_B_mem) {
+    int64_t M = A_f16_mem.get_desc().get_dims()[0];
+    int64_t N = sc_B_mem.get_desc().get_dims()[0];
+    int64_t K = A_f16_mem.get_desc().get_dims()[1];
+    int64_t NUM_G_SC = sc_B_mem.get_desc().get_dims()[0];
+    int64_t NUM_G_ZP_K = zp_B_mem.get_desc().get_dims()[0];
+    // 8 INT4 values are packed as INT32 in N direction
+    // oneDNN APIs consider zero-points as INT4 elements which are NOT packed into INT32 value
+    int64_t NUM_G_ZP_N = zp_B_mem.get_desc().get_dims()[1] / 8;
+    
+    std::vector<float> A_f32(M * K);
+    init_vector(A_f32);
+    // Fill A_f16_mem f16 data from A_f32 data filled as f32
+    write_to_dnnl_memory(A_f32.data(), A_f16_mem);
 
-    // Pre-packed weights stored as int4
-    memory B_s4_mem(matmul_pd.weights_desc(), eng);
-    {
-        memory B_f32_mem(
-                {{K, N}, memory::data_type::f32, memory::format_tag::ab}, eng);
-        write_to_dnnl_memory(B_f32.data(), B_f32_mem);
-        reorder(B_f32_mem, B_s4_mem).execute(s, B_f32_mem, B_s4_mem);
-        s.wait();
-    }
-    matmul matmul_p(matmul_pd);
-
-    // input of the current layer / operation
-    memory A_f32_mem({{M, K}, memory::data_type::f32, {K, 1}}, eng);
-    // De-quantization parameters (eg. Scale and Shift)
-    const int64_t n_groups = K / G;
-    memory sc_B_mem({{N, n_groups}, memory::data_type::f32, {1, N}}, eng);
-
-    // Pre-packed zp stored as int4
-    // A unique zero point is used for each weight in this example
-    // Allocates memory for zp_B_s4_mem with specified dimensions and data type.
-    memory zp_B_s4_mem({{K, N}, memory::data_type::s4, {1, K}}, eng);
-    {
-        memory zp_B_f32_mem({{K, N}, memory::data_type::f32, {1, K}}, eng);
-        write_to_dnnl_memory(zp_B_f32.data(), zp_B_f32_mem);
-        reorder(zp_B_f32_mem, zp_B_s4_mem)
-                .execute(s, zp_B_f32_mem, zp_B_s4_mem);
-        s.wait();
-    }
-
-    write_to_dnnl_memory(A_f32.data(), A_f32_mem);
+    std::vector<float> sc_B(NUM_G_SC * N);
+    init_vector(sc_B);
+    // Fill sc_B_mem f16 data from sc_B data filled as f32
     write_to_dnnl_memory(sc_B.data(), sc_B_mem);
 
-    // output - no initialization required
-    memory C_f32_mem({{M, N}, memory::data_type::f32, {N, 1}}, eng);
+    std::vector<int32_t> zp_transpose_B(NUM_G_ZP_K * NUM_G_ZP_N);
+    init_vector(zp_transpose_B);
+    // Transpose the s4 data to match the format tag::ab
+    std::vector<int32_t> zp_B(NUM_G_ZP_K * NUM_G_ZP_N);
+    transpose_s4(zp_transpose_B, zp_B, NUM_G_ZP_K , NUM_G_ZP_N);
+    // Fill zp_B_mem s4 data from zp_B data filled as s32
+    write_to_dnnl_memory(zp_B.data(), zp_B_mem);
+}
 
-    matmul_p.execute(s,
-            {{DNNL_ARG_SRC, A_f32_mem}, {DNNL_ARG_WEIGHTS, B_s4_mem},
-                    {DNNL_ARG_DST, C_f32_mem},
-                    {DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, sc_B_mem},
-                    {DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_WEIGHTS,
-                            zp_B_s4_mem}});
+void infer(const matmul &matmul_p, int64_t M, int64_t N, int64_t K, int64_t G_SC,
+        int64_t G_ZP, const memory &B_s4_mem, const engine &eng) {
+    // input of the current layer / operation
+    memory A_f16_mem({{M, K}, memory::data_type::f16, {K, 1}}, eng);
+    // scale is grouped in K direction [K/G_SC, N]
+    memory sc_B_mem({{K / G_SC, N}, memory::data_type::f16, {N, 1}}, eng);
+    // zeros point is grouped in K direction and packed in to INT32 in N direction: [K/G_ZP, N/8]
+    // oneDNN APIs consider zero-points as INT4 elements which are NOT packed into INT32 value
+    memory zp_B_mem({{K / G_ZP, N}, memory::data_type::s4, {N, 1}}, eng);
+
+    // the function below fills dnnl::memory with some values
+    // these memories, typically, come from the previous layers / operations
+    // with meaningful data inside
+    prepare_input(A_f16_mem, sc_B_mem, zp_B_mem);
+
+    // output - no initialization required
+    memory C_f16_mem({{M, N}, memory::data_type::f16, {N, 1}}, eng);
+
+    stream s(eng);
+    for (int32_t run = 0; run < number_of_runs; ++run)
+        matmul_p.execute(s,
+                {{DNNL_ARG_SRC, A_f16_mem}, {DNNL_ARG_WEIGHTS, B_s4_mem},
+                        {DNNL_ARG_DST, C_f16_mem},
+                        {DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, sc_B_mem},
+                        {DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_WEIGHTS,
+                                zp_B_mem}});
     s.wait();
 }
 
-// Compares the results of reference matrix multiplication and oneDNN weights
-// decompression.
-void compare_ref_and_weights_decompression(engine::kind engine_kind) {
+void int4_weights_decompression_matmul(engine::kind engine_kind) {
     engine eng(engine_kind, 0);
 
-    // MatMul parameters
-    const int64_t M = 1, N = 4096, K = 1024;
-    // Quantization Group size for scales
-    const int64_t G = 64;
+    const int64_t K = 96;
+    const int64_t N = 1000;
+    const int64_t M = 100;
+    // Quantization Group size for scales in K direction
+    const int64_t G_SC = K / 2;
+    // Quantization Group size for zero points in K direction
+    const int64_t G_ZP = K / 4;
 
-    // Prepare matrices
-    std::vector<float> A_f32(M * K), C_ref(M * N), sc_B(K * N / G);
-    std::vector<float> B_f32(K * N);
-    std::vector<float> zp_B_f32(K * N);
-    init_vector(A_f32);
-    init_vector(B_f32);
-    init_vector(sc_B);
-    init_vector(zp_B_f32);
-    init_vector(C_ref);
-    std::vector<float> C_onednn = C_ref;
+    auto matmul_pd = matmul_pd_create(M, N, K, G_SC, G_ZP, eng);
 
-    // Compute _true_ C_ref result
-    ref_compute_matmul_f32(M, N, K, G, A_f32, B_f32, zp_B_f32, sc_B, C_ref);
+    // Original weights stored by packing 8 INT4 values in N direction as INT32 in a format tag::ba.
+    // oneDNN doesn't have a notion of format for zero-points and it's always considered as tag::ab.
+    // The example of memory::desc for transposed weights with format tag::ba is below.
+    // memory::desc B_s32_trans_md({K, N / 8}, memory::data_type::s32, memory::format_tag::ba);
+    // The example of memory::desc for weights with format tag::ab is below.
+    // memory::desc B_s32_md({K, N / 8}, memory::data_type::s32, memory::format_tag::ab);
+    // In this example, we transpose the weights data to match the format tag::ab of the zero-points.
+    std::vector<int32_t> B_s32_trans_data(K * N / 8);
+    init_vector(B_s32_trans_data);
 
-    // Compute _true_ C_onednn result
-    weights_decompression_matmul(
-            M, N, K, G, A_f32, B_f32, zp_B_f32, sc_B, C_onednn, eng);
+    // Transpose the s4 data to match the format tag::ab
+    std::vector<int32_t> B_s32_data(K * N / 8);
+    transpose_s4(B_s32_trans_data, B_s32_data, K, N / 8);
 
-    int rc = 0;
-    rc |= compare_vectors(
-            C_ref, C_onednn, K, "Compare ref vs oneDNN weights decompression");
-    if (rc) throw std::logic_error("The resulting matrices diverged too much.");
+    // This way of constrcuting memory causes segfault on GPU:
+    // Fill B_s4_mem data using handle from B_s32 data filled as INT32
+    // memory B_s4_mem(matmul_pd.weights_desc(), eng, B_s32_data.data());
+
+    // Fill B_s4_mem data using the write_to_dnnl_memory function from B_s32 data filled as INT32
+    memory B_s4_mem(matmul_pd.weights_desc(), eng);
+    write_to_dnnl_memory(B_s32_data.data(), B_s4_mem);
+
+    matmul matmul_p(matmul_pd);
+
+    infer(matmul_p, M, N, K, G_SC, G_ZP, B_s4_mem, eng);
 }
 
 int main(int argc, char **argv) {
     engine::kind engine_kind = parse_engine_kind(argc, argv);
-    return handle_example_errors(
-            compare_ref_and_weights_decompression, engine_kind);
+    return handle_example_errors(int4_weights_decompression_matmul, engine_kind);
 }
